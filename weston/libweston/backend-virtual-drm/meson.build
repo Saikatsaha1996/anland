@@ -11,6 +11,7 @@ srcs_vdrm = [
 	join_paths(vdrm_root, 'libdisplay_producer', 'display_producer.c'),
 	join_paths(vdrm_root, 'common', 'socket_utils.c'),
 	presentation_time_server_protocol_h,
+	tablet_unstable_v2_server_protocol_h,
 ]
 
 plugin_vdrm = shared_library(

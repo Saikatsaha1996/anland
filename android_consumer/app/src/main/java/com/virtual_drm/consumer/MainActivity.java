@@ -34,6 +34,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private native void nativeSendMouseMotion(float x, float y);
     private native void nativeSendMouseButton(int button, boolean pressed);
     private native void nativeSendMouseScroll(int axis, float value);
+    private native void nativeSendTablet(int action, float x, float y,
+                                         float pressure, float tiltX, float tiltY,
+                                         int toolType);
+    private native void nativeSendTabletButton(int button, boolean pressed);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -113,13 +117,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        if (isMouseEvent(event))
+        if (isStylusEvent(event))
+            return handleStylusEvent(event);
+        if (isMouseEvent(event)) {
+            int cls = event.getClassification();
+            if (cls == CLASSIFICATION_TWO_FINGER_SWIPE)
+                return handleTouchpadScroll(event);
+            if (cls == CLASSIFICATION_MULTI_FINGER_SWIPE || cls == CLASSIFICATION_PINCH)
+                return handleTouchEvent(event);
             return handleMouseEvent(event);
+        }
         return handleTouchEvent(event);
     }
 
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
+        if (isStylusEvent(event))
+            return handleStylusHover(event);
         if (isMouseEvent(event)) {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_HOVER_MOVE) {
@@ -161,6 +175,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return true;
     }
 
+    private static final int CLASSIFICATION_TWO_FINGER_SWIPE = 3;
+    private static final int CLASSIFICATION_MULTI_FINGER_SWIPE = 4;
+    private static final int CLASSIFICATION_PINCH = 5;
+
+    private static final int TABLET_PROXIMITY_IN  = 0;
+    private static final int TABLET_PROXIMITY_OUT = 1;
+    private static final int TABLET_DOWN          = 2;
+    private static final int TABLET_UP            = 3;
+    private static final int TABLET_MOTION        = 4;
+
+    private static final int TABLET_TOOL_PEN    = 0;
+    private static final int TABLET_TOOL_ERASER = 1;
+
+    private static final int BTN_STYLUS  = 0x14a;
+    private static final int BTN_STYLUS2 = 0x14b;
+
+    private boolean stylusInProximity = false;
+    private int savedStylusBS = 0;
+
     private int savedBS = 0;
 
     private static final int[][] BUTTON_MAP = {
@@ -171,11 +204,115 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         {MotionEvent.BUTTON_FORWARD,   0x114}, // BTN_EXTRA
     };
 
+    private boolean isStylusEvent(MotionEvent event) {
+        int toolType = event.getToolType(event.getActionIndex());
+        return toolType == MotionEvent.TOOL_TYPE_STYLUS
+            || toolType == MotionEvent.TOOL_TYPE_ERASER;
+    }
+
+    private int stylusToolType(MotionEvent event) {
+        return event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_ERASER
+            ? TABLET_TOOL_ERASER : TABLET_TOOL_PEN;
+    }
+
+    private float stylusTiltX(MotionEvent event) {
+        float orientation = event.getOrientation();
+        float tilt = event.getAxisValue(MotionEvent.AXIS_TILT);
+        return (float)(Math.toDegrees(Math.sin(orientation) * tilt));
+    }
+
+    private float stylusTiltY(MotionEvent event) {
+        float orientation = event.getOrientation();
+        float tilt = event.getAxisValue(MotionEvent.AXIS_TILT);
+        return (float)(Math.toDegrees(-Math.cos(orientation) * tilt));
+    }
+
+    private void sendStylusButtons(MotionEvent event) {
+        int currentBS = event.getButtonState();
+        boolean was1 = (savedStylusBS & MotionEvent.BUTTON_STYLUS_PRIMARY) != 0;
+        boolean is1  = (currentBS & MotionEvent.BUTTON_STYLUS_PRIMARY) != 0;
+        if (was1 != is1)
+            nativeSendTabletButton(BTN_STYLUS, is1);
+        boolean was2 = (savedStylusBS & MotionEvent.BUTTON_STYLUS_SECONDARY) != 0;
+        boolean is2  = (currentBS & MotionEvent.BUTTON_STYLUS_SECONDARY) != 0;
+        if (was2 != is2)
+            nativeSendTabletButton(BTN_STYLUS2, is2);
+        savedStylusBS = currentBS;
+    }
+
+    private boolean handleStylusHover(MotionEvent event) {
+        int action = event.getActionMasked();
+        int tool = stylusToolType(event);
+        float x = event.getX(), y = event.getY();
+        float pressure = 0;
+        float tx = stylusTiltX(event), ty = stylusTiltY(event);
+
+        if (action == MotionEvent.ACTION_HOVER_ENTER) {
+            stylusInProximity = true;
+            nativeSendTablet(TABLET_PROXIMITY_IN, x, y, pressure, tx, ty, tool);
+            return true;
+        }
+        if (action == MotionEvent.ACTION_HOVER_EXIT) {
+            nativeSendTablet(TABLET_PROXIMITY_OUT, x, y, pressure, tx, ty, tool);
+            stylusInProximity = false;
+            savedStylusBS = 0;
+            return true;
+        }
+        if (action == MotionEvent.ACTION_HOVER_MOVE) {
+            if (!stylusInProximity) {
+                stylusInProximity = true;
+                nativeSendTablet(TABLET_PROXIMITY_IN, x, y, pressure, tx, ty, tool);
+            }
+            nativeSendTablet(TABLET_MOTION, x, y, pressure, tx, ty, tool);
+            sendStylusButtons(event);
+            return true;
+        }
+        return true;
+    }
+
+    private boolean handleStylusEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        int tool = stylusToolType(event);
+        float x = event.getX(), y = event.getY();
+        float pressure = event.getPressure();
+        float tx = stylusTiltX(event), ty = stylusTiltY(event);
+
+        if (!stylusInProximity) {
+            stylusInProximity = true;
+            nativeSendTablet(TABLET_PROXIMITY_IN, x, y, pressure, tx, ty, tool);
+        }
+
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                nativeSendTablet(TABLET_MOTION, x, y, pressure, tx, ty, tool);
+                nativeSendTablet(TABLET_DOWN, x, y, pressure, tx, ty, tool);
+                sendStylusButtons(event);
+                break;
+            case MotionEvent.ACTION_MOVE:
+                nativeSendTablet(TABLET_MOTION, x, y, pressure, tx, ty, tool);
+                sendStylusButtons(event);
+                break;
+            case MotionEvent.ACTION_UP:
+                nativeSendTablet(TABLET_MOTION, x, y, pressure, tx, ty, tool);
+                nativeSendTablet(TABLET_UP, x, y, pressure, tx, ty, tool);
+                sendStylusButtons(event);
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                nativeSendTablet(TABLET_UP, x, y, 0, tx, ty, tool);
+                break;
+        }
+        return true;
+    }
+
     private boolean isMouseEvent(MotionEvent event) {
-        if ((event.getSource() & InputDevice.SOURCE_MOUSE) == 0)
+        int source = event.getSource();
+        if ((source & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
+            return false;
+        if ((source & InputDevice.SOURCE_MOUSE) != InputDevice.SOURCE_MOUSE)
             return false;
         int toolType = event.getToolType(event.getActionIndex());
-        return toolType == MotionEvent.TOOL_TYPE_MOUSE;
+        return toolType == MotionEvent.TOOL_TYPE_MOUSE
+            || toolType == MotionEvent.TOOL_TYPE_FINGER;
     }
 
     private boolean handleMouseEvent(MotionEvent event) {
@@ -189,6 +326,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 nativeSendMouseButton(btn[1], isDown);
         }
         savedBS = currentBS;
+        return true;
+    }
+
+    private boolean handleTouchpadScroll(MotionEvent event) {
+        if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
+            float scrollX = event.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_X_DISTANCE);
+            float scrollY = event.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE);
+            if (scrollY != 0)
+                nativeSendMouseScroll(0, scrollY);
+            if (scrollX != 0)
+                nativeSendMouseScroll(1, -scrollX);
+        }
         return true;
     }
 

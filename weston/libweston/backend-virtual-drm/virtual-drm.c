@@ -23,6 +23,9 @@
 #include "presentation-time-server-protocol.h"
 #include <libweston/windowed-output-api.h>
 
+#include "backend.h"
+#include "libweston-internal.h"
+#include "tablet-unstable-v2-server-protocol.h"
 #include "display_producer.h"
 
 #define DEFAULT_SOCKET_PATH "/tmp/display_daemon.sock"
@@ -49,6 +52,10 @@ struct vdrm_backend {
 
 	struct wl_event_source *input_source;
 	struct weston_touch_device *touch_device;
+
+	struct weston_tablet *tablet;
+	struct weston_tablet_tool *tablet_tool;
+	bool tablet_in_proximity;
 
 	struct wl_event_source *buf_ready_source;
 	bool consumer_ready;
@@ -227,6 +234,100 @@ vdrm_handle_touch_frame(struct vdrm_backend *b)
 }
 
 static void
+vdrm_handle_tablet(struct vdrm_backend *b, const struct InputEvent *ev)
+{
+	struct timespec ts;
+	struct weston_output *output;
+	struct weston_coord_global pos;
+	const int NORMALIZED_AXIS_MAX = 65535;
+
+	if (!b->tablet || !b->tablet_tool)
+		return;
+
+	weston_compositor_get_time(&ts);
+
+	output = weston_compositor_find_output_by_name(b->compositor,
+						       "virtual-drm-1");
+	if (!output)
+		return;
+
+	pos = weston_coord_global_from_output_point(ev->tablet.x,
+						    ev->tablet.y, output);
+
+	switch (ev->tablet.action) {
+	case TABLET_ACTION_PROXIMITY_IN:
+		if (!b->tablet_in_proximity) {
+			b->tablet_tool->type = (ev->tablet.tool_type == TABLET_TOOL_ERASER)
+				? ZWP_TABLET_TOOL_V2_TYPE_ERASER
+				: ZWP_TABLET_TOOL_V2_TYPE_PEN;
+			notify_tablet_tool_proximity_in(b->tablet_tool, &ts,
+							b->tablet);
+			b->tablet_in_proximity = true;
+		}
+		notify_tablet_tool_motion(b->tablet_tool, &ts, pos);
+		notify_tablet_tool_pressure(b->tablet_tool, &ts,
+					    (uint32_t)(ev->tablet.pressure * NORMALIZED_AXIS_MAX));
+		notify_tablet_tool_tilt(b->tablet_tool, &ts,
+					wl_fixed_from_double(ev->tablet.tilt_x),
+					wl_fixed_from_double(ev->tablet.tilt_y));
+		notify_tablet_tool_frame(b->tablet_tool, &ts);
+		break;
+
+	case TABLET_ACTION_PROXIMITY_OUT:
+		if (b->tablet_in_proximity) {
+			notify_tablet_tool_proximity_out(b->tablet_tool, &ts);
+			notify_tablet_tool_frame(b->tablet_tool, &ts);
+			b->tablet_in_proximity = false;
+		}
+		break;
+
+	case TABLET_ACTION_DOWN:
+		notify_tablet_tool_motion(b->tablet_tool, &ts, pos);
+		notify_tablet_tool_pressure(b->tablet_tool, &ts,
+					    (uint32_t)(ev->tablet.pressure * NORMALIZED_AXIS_MAX));
+		notify_tablet_tool_tilt(b->tablet_tool, &ts,
+					wl_fixed_from_double(ev->tablet.tilt_x),
+					wl_fixed_from_double(ev->tablet.tilt_y));
+		notify_tablet_tool_down(b->tablet_tool, &ts);
+		notify_tablet_tool_frame(b->tablet_tool, &ts);
+		break;
+
+	case TABLET_ACTION_UP:
+		notify_tablet_tool_motion(b->tablet_tool, &ts, pos);
+		notify_tablet_tool_up(b->tablet_tool, &ts);
+		notify_tablet_tool_frame(b->tablet_tool, &ts);
+		break;
+
+	case TABLET_ACTION_MOTION:
+		notify_tablet_tool_motion(b->tablet_tool, &ts, pos);
+		notify_tablet_tool_pressure(b->tablet_tool, &ts,
+					    (uint32_t)(ev->tablet.pressure * NORMALIZED_AXIS_MAX));
+		notify_tablet_tool_tilt(b->tablet_tool, &ts,
+					wl_fixed_from_double(ev->tablet.tilt_x),
+					wl_fixed_from_double(ev->tablet.tilt_y));
+		notify_tablet_tool_frame(b->tablet_tool, &ts);
+		break;
+	}
+}
+
+static void
+vdrm_handle_tablet_button(struct vdrm_backend *b, const struct InputEvent *ev)
+{
+	struct timespec ts;
+
+	if (!b->tablet_tool || !b->tablet_in_proximity)
+		return;
+
+	weston_compositor_get_time(&ts);
+	notify_tablet_tool_button(b->tablet_tool, &ts,
+				  ev->tablet_button.button,
+				  ev->tablet_button.pressed ?
+				  ZWP_TABLET_TOOL_V2_BUTTON_STATE_PRESSED :
+				  ZWP_TABLET_TOOL_V2_BUTTON_STATE_RELEASED);
+	notify_tablet_tool_frame(b->tablet_tool, &ts);
+}
+
+static void
 vdrm_process_input_event(struct vdrm_backend *b, const struct InputEvent *ev)
 {
 	switch (ev->type) {
@@ -247,6 +348,12 @@ vdrm_process_input_event(struct vdrm_backend *b, const struct InputEvent *ev)
 		break;
 	case INPUT_TYPE_TOUCH_FRAME:
 		vdrm_handle_touch_frame(b);
+		break;
+	case INPUT_TYPE_TABLET:
+		vdrm_handle_tablet(b, ev);
+		break;
+	case INPUT_TYPE_TABLET_BUTTON:
+		vdrm_handle_tablet_button(b, ev);
 		break;
 	}
 }
@@ -270,6 +377,16 @@ vdrm_fallback_cb(void *data)
 
 	if (b->seat.pointer_state)
 		clear_pointer_focus(&b->seat);
+
+	if (b->tablet_tool && b->tablet_in_proximity) {
+		struct timespec ts;
+		weston_compositor_get_time(&ts);
+		if (b->tablet_tool->tip_is_down)
+			notify_tablet_tool_up(b->tablet_tool, &ts);
+		notify_tablet_tool_proximity_out(b->tablet_tool, &ts);
+		notify_tablet_tool_frame(b->tablet_tool, &ts);
+		b->tablet_in_proximity = false;
+	}
 
 	if (b->buf_ready_source) {
 		wl_event_source_remove(b->buf_ready_source);
@@ -747,12 +864,34 @@ vdrm_input_init(struct vdrm_backend *b)
 	b->touch_device = weston_touch_create_touch_device(
 		b->seat.touch_state, "virtual-drm-touch", NULL, NULL, NULL);
 
+	b->tablet = weston_seat_add_tablet(&b->seat);
+	b->tablet->name = strdup("virtual-drm-tablet");
+	wl_list_insert(&b->seat.tablet_list, &b->tablet->link);
+	notify_tablet_added(b->tablet);
+
+	b->tablet_tool = weston_seat_add_tablet_tool(&b->seat);
+	b->tablet_tool->type = ZWP_TABLET_TOOL_V2_TYPE_PEN;
+	b->tablet_tool->capabilities =
+		(1 << ZWP_TABLET_TOOL_V2_CAPABILITY_PRESSURE) |
+		(1 << ZWP_TABLET_TOOL_V2_CAPABILITY_TILT) |
+		(1 << ZWP_TABLET_TOOL_V2_CAPABILITY_DISTANCE);
+	wl_list_insert(&b->tablet->tool_list, &b->tablet_tool->link);
+	notify_tablet_tool_added(b->tablet_tool);
+
 	return true;
 }
 
 static void
 vdrm_input_destroy(struct vdrm_backend *b)
 {
+	if (b->tablet_tool) {
+		weston_seat_release_tablet_tool(b->tablet_tool);
+		b->tablet_tool = NULL;
+	}
+	if (b->tablet) {
+		weston_seat_release_tablet(b->tablet);
+		b->tablet = NULL;
+	}
 	if (b->touch_device) {
 		weston_touch_device_destroy(b->touch_device);
 		b->touch_device = NULL;

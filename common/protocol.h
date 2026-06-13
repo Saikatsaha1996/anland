@@ -49,10 +49,21 @@ struct buf_info {
 #define INPUT_TYPE_POINTER_BUTTON 4
 #define INPUT_TYPE_POINTER_AXIS   5
 #define INPUT_TYPE_TOUCH_FRAME    6
+#define INPUT_TYPE_TABLET         7
+#define INPUT_TYPE_TABLET_BUTTON  8
 
 #define INPUT_ACTION_DOWN    0
 #define INPUT_ACTION_UP      1
 #define INPUT_ACTION_MOVE    2
+
+#define TABLET_ACTION_PROXIMITY_IN   0
+#define TABLET_ACTION_PROXIMITY_OUT  1
+#define TABLET_ACTION_DOWN           2
+#define TABLET_ACTION_UP             3
+#define TABLET_ACTION_MOTION         4
+
+#define TABLET_TOOL_PEN     0
+#define TABLET_TOOL_ERASER  1
 
 struct InputEvent {
     uint32_t type;
@@ -80,6 +91,19 @@ struct InputEvent {
             float    value;
             int32_t  discrete;
         } pointer_axis;
+        struct {
+            int32_t  action;
+            float    x;
+            float    y;
+            float    pressure;
+            float    tilt_x;
+            float    tilt_y;
+            int32_t  tool_type;
+        } tablet;
+        struct {
+            uint32_t button;
+            int32_t  pressed;
+        } tablet_button;
     };
 } __attribute__((packed));
 

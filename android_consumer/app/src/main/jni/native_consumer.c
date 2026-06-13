@@ -440,3 +440,36 @@ Java_com_virtual_1drm_consumer_MainActivity_nativeSendMouseScroll(
     };
     push_input_event(g_state.ctx, &ev);
 }
+
+JNIEXPORT void JNICALL
+Java_com_virtual_1drm_consumer_MainActivity_nativeSendTablet(
+    JNIEnv *env, jobject thiz, jint action, jfloat x, jfloat y,
+    jfloat pressure, jfloat tiltX, jfloat tiltY, jint toolType)
+{
+    if (!g_state.ctx)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TABLET,
+        .tablet = {
+            .action = action,
+            .x = x, .y = y,
+            .pressure = pressure,
+            .tilt_x = tiltX, .tilt_y = tiltY,
+            .tool_type = toolType,
+        },
+    };
+    push_input_event(g_state.ctx, &ev);
+}
+
+JNIEXPORT void JNICALL
+Java_com_virtual_1drm_consumer_MainActivity_nativeSendTabletButton(
+    JNIEnv *env, jobject thiz, jint button, jboolean pressed)
+{
+    if (!g_state.ctx)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TABLET_BUTTON,
+        .tablet_button = { .button = button, .pressed = pressed ? 1 : 0 },
+    };
+    push_input_event(g_state.ctx, &ev);
+}
