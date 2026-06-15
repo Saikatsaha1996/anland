@@ -1,0 +1,263 @@
+diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/platform_wayland.c
+index e56b7c8..76bd241 100644
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -2704,6 +2704,18 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
+          goto cleanup;
+    }
+ 
++   /* On the kgsl stack the compositor advertises neither wl_drm nor a v4
++    * dma-buf feedback main device, so the paths above can leave us without a
++    * render GPU fd even though _extensions() "succeeded" (v3 dma-buf only).
++    * Open the kgsl GPU node directly as a last resort so the native freedreno
++    * GL driver still comes up instead of leaving fd = -1 (-> dri2 screen
++    * creation fails, black window). */
++   if (dri2_dpy->fd_render_gpu == -1) {
++      dri2_dpy->fd_render_gpu = loader_open_device("/dev/kgsl-3d0");
++      if (dri2_dpy->fd_render_gpu == -1)
++         goto cleanup;
++   }
++
+    loader_get_user_preferred_fd(&dri2_dpy->fd_render_gpu,
+                                 &dri2_dpy->fd_display_gpu);
+ 
+diff --git a/src/freedreno/drm/freedreno_device.c b/src/freedreno/drm/freedreno_device.c
+index 517bb48..141716b 100644
+--- a/src/freedreno/drm/freedreno_device.c
++++ b/src/freedreno/drm/freedreno_device.c
+@@ -6,6 +6,7 @@
+  *    Rob Clark <robclark@freedesktop.org>
+  */
+ 
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -36,9 +37,43 @@ fd_device_new(int fd)
+    drmVersionPtr version = NULL;
+    bool use_heap = false;
+    bool support_use_heap = true;
++   /* The fd used for GPU submission. Defaults to the fd we were handed, but on
++    * the kgsl stack it is redirected to the kgsl GPU node while the original fd
++    * is retained as the device control/identity fd (see below). */
++   int gpu_fd = fd;
+ 
+    os_get_page_size(&os_page_size);
+ 
++#if HAVE_FREEDRENO_KGSL
++   /* On the kgsl stack the Adreno GPU is reachable only through the
++    * /dev/kgsl-3d0 char device, never through a DRM render node.  EGL/GBM may
++    * hand us the display controller's DRM node (sde-kms renderD128), which
++    * drmGetVersion reports as "msm" even though it drives no GPU at all -
++    * taking the msm path there yields a half-initialised screen that crashes
++    * on the first capability query.  When kgsl is forced (the whole kgsl stack
++    * exports FD_FORCE_KGSL=1), ignore the fd we were handed and open the kgsl
++    * GPU node directly for rendering.  The fd we were handed is kept as the
++    * device control/identity fd (dev->control_fd, returned by fd_device_fd):
++    * it still identifies the screen for u_pipe_screen_lookup_or_create()'s
++    * fd-keyed cache (which compares file descriptions, so dev->fd MUST stay a
++    * dup of the cache key - a freshly opened kgsl fd is a different file
++    * description and would break cache eviction -> use-after-free) and is the
++    * fd handed to DRI3 clients.  Only GPU submission uses the kgsl fd. */
++   if (debug_get_bool_option("FD_FORCE_KGSL", false)) {
++      int kgsl_fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
++      if (kgsl_fd >= 0) {
++         dev = kgsl_device_new(kgsl_fd);
++         if (dev) {
++            /* Userspace fences are not supported with KGSL */
++            support_use_heap = false;
++            gpu_fd = kgsl_fd;   /* render on kgsl, keep fd as control_fd */
++            goto out;
++         }
++         close(kgsl_fd);
++      }
++   }
++#endif
++
+ #ifdef HAVE_LIBDRM
+    /* figure out if we are kgsl or msm drm driver: */
+    version = drmGetVersion(fd);
+@@ -81,8 +116,32 @@ fd_device_new(int fd)
+ #endif
+    }
+ 
++#if HAVE_FREEDRENO_KGSL
++   /* On the kgsl stack the Adreno GPU is reachable only through the
++    * /dev/kgsl-3d0 char device, never through a DRM render node.  When EGL is
++    * driven via GBM (e.g. Xwayland glamor) the fd handed to us is the display
++    * controller's DRM node (sde-kms renderD128) or some other non-kgsl fd, so
++    * neither the msm path nor kgsl-on-this-fd above can produce a device.
++    * Open the kgsl GPU node directly as a last resort so native freedreno GL
++    * still comes up instead of failing dri2 screen creation. */
++   if (!dev) {
++      int kgsl_fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
++      if (kgsl_fd >= 0) {
++         dev = kgsl_device_new(kgsl_fd);
++         if (dev) {
++            support_use_heap = false;
++            /* Render on the kgsl GPU node; keep the fd we were handed as the
++             * control/identity fd (see the FD_FORCE_KGSL block above). */
++            gpu_fd = kgsl_fd;
++         } else {
++            close(kgsl_fd);
++         }
++      }
++   }
++#endif
++
+    if (!dev) {
+-      INFO_MSG("unsupported device: %s", version->name);
++      INFO_MSG("unsupported device: %s", version ? version->name : "(none)");
+       goto out;
+    }
+ 
+@@ -98,7 +157,11 @@ out:
+    fd_rd_output_init(&dev->rd, util_get_process_name());
+ 
+    p_atomic_set(&dev->refcnt, 1);
+-   dev->fd = fd;
++   dev->fd = gpu_fd;
++   /* control_fd identifies the screen for the fd-keyed screen cache and DRI3;
++    * it is a dup of the cache key. It equals fd unless rendering was redirected
++    * to a separate kgsl GPU node above, in which case fd != gpu_fd. */
++   dev->control_fd = fd;
+    dev->handle_table =
+       _mesa_hash_table_create(NULL, _mesa_hash_u32, _mesa_key_u32_equal);
+    dev->name_table =
+@@ -218,8 +281,14 @@ fd_device_del(struct fd_device *dev)
+    if (fd_device_threaded_submit(dev))
+       util_queue_destroy(&dev->submit_queue);
+ 
+-   if (dev->closefd)
++   if (dev->closefd) {
+       close(dev->fd);
++      /* On the kgsl stack control_fd is a distinct fd from the kgsl GPU fd;
++       * close it too so it does not leak (guard against double-close when they
++       * are the same fd, the common case). */
++      if (dev->control_fd >= 0 && dev->control_fd != dev->fd)
++         close(dev->control_fd);
++   }
+ 
+    free(dev);
+ }
+@@ -227,7 +296,10 @@ fd_device_del(struct fd_device *dev)
+ int
+ fd_device_fd(struct fd_device *dev)
+ {
+-   return dev->fd;
++   /* Return the control/identity fd, not the GPU submission fd. On the kgsl
++    * stack these differ: the screen cache and DRI3 must see the fd we were
++    * handed (a dup of the cache key), while GPU submission uses dev->fd. */
++   return dev->control_fd;
+ }
+ 
+ enum fd_version
+diff --git a/src/freedreno/drm/freedreno_priv.h b/src/freedreno/drm/freedreno_priv.h
+index 68ce2ee..19c9d37 100644
+--- a/src/freedreno/drm/freedreno_priv.h
++++ b/src/freedreno/drm/freedreno_priv.h
+@@ -188,7 +188,8 @@ submit_offset(struct fd_bo *bo, uint32_t offset)
+ }
+ 
+ struct fd_device {
+-   int fd;
++   int fd;          /* GPU submission fd (kgsl GPU node on the kgsl stack) */
++   int control_fd;  /* screen-cache / DRI3 identity fd; == fd unless redirected */
+    enum fd_version version;
+    int32_t refcnt;
+    uint32_t features;
+diff --git a/src/freedreno/drm/kgsl/kgsl_pipe.c b/src/freedreno/drm/kgsl/kgsl_pipe.c
+index d48f186..4760212 100644
+--- a/src/freedreno/drm/kgsl/kgsl_pipe.c
++++ b/src/freedreno/drm/kgsl/kgsl_pipe.c
+@@ -99,6 +99,12 @@ kgsl_pipe_get_param(struct fd_pipe *pipe, enum fd_param_id param,
+       return -1;
+    case FD_TIMESTAMP:
+       return -1;
++   case FD_UCHE_TRAP_BASE:
++      /* KGSL doesn't expose the UCHE trap base; return failure quietly so the
++       * gallium screen falls back to its built-in default (see
++       * freedreno_screen.c) instead of aborting device-info retrieval with a
++       * noisy "invalid param id" error. */
++      return -1;
+    default:
+       ERROR_MSG("invalid param id: %d", param);
+       return -1;
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 65e87d7..5c555e4 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3451,6 +3451,23 @@ tu_GetInstanceProcAddr(VkInstance _instance, const char *pName)
+                                     pName);
+ }
+ 
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++tu_GetDeviceProcAddr(VkDevice _device, const char *pName)
++{
++   VK_FROM_HANDLE(tu_device, device, _device);
++   return vk_device_get_proc_addr(&device->vk, pName);
++}
++
++/* Required ICD entrypoint for the loader */
++PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vk_icdGetDeviceProcAddr(VkDevice device, const char *pName);
++
++PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vk_icdGetDeviceProcAddr(VkDevice device, const char *pName)
++{
++   return tu_GetDeviceProcAddr(device, pName);
++}
++
+ /* The loader wants us to expose a second GetInstanceProcAddr function
+  * to work around certain LD_PRELOAD issues seen in apps.
+  */
+diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
+index fbea64c..70a90d6 100644
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -383,6 +383,15 @@ fd_init_screen_caps(struct fd_screen *screen)
+ 
+    u_init_pipe_screen_caps(&screen->base, 1);
+ 
++   /* On the kgsl stack the screen's control fd is the sde-kms display node
++    * (renderD128); drmGetCap(DRM_CAP_PRIME) there does not report the GPU's
++    * real PRIME import/export support, so u_init_pipe_screen_caps() leaves
++    * caps.dmabuf unset and EGL never advertises EGL_EXT_image_dma_buf_import
++    * (which kwin/GL compositors need to import client buffers).  The kgsl
++    * backend does support dmabuf import/export (FD_FEATURE_IMPORT_DMABUF), so
++    * force the cap on. */
++   caps->dmabuf = 0x1 /*DRM_PRIME_CAP_IMPORT*/ | 0x2 /*DRM_PRIME_CAP_EXPORT*/;
++
+    /* this is probably not totally correct.. but it's a start: */
+ 
+    /* Supported features (boolean caps). */
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index bcbb2c5..cf6a159 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1684,9 +1684,25 @@ zink_destroy_screen(struct pipe_screen *pscreen)
+    glsl_type_singleton_decref();
+ }
+ 
++/* On the kgsl-backed turnip stack the GBM/DRI3 fd points at the display
++ * device (msm_drm) while the GPU is exposed through kgsl, so the render-node
++ * DRM major/minor never matches turnip's pdev and device selection fails
++ * (-> llvmpipe fallback). When this env is set, skip the DRM-based matching
++ * for the DRI3 path and let zink take the default (first) physical device. */
++static bool
++zink_force_default_device_dri3(uint64_t adapter_luid)
++{
++   return !adapter_luid &&
++          debug_get_bool_option("MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE_DRI3",
++                                false);
++}
++
+ static bool
+ zink_picks_device(int dev_major, uint64_t adapter_luid)
+ {
++   if (zink_force_default_device_dri3(adapter_luid))
++      return false;
++
+    return (dev_major > 0 && dev_major < 255) || adapter_luid;
+ }
+ 
